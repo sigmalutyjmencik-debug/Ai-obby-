@@ -1,0 +1,327 @@
+--[[
+    ULTIMATE OBBY BOT v.9 (УМНЫЙ ВЫБОР ПУТИ)
+    - Сканирование сектора 15 студий
+    - Определение наличия земли/платформы в каждом направлении
+    - Выбор направления с опорой (приоритет центральным)
+    - Сплошная зелёная линия-хвост
+--]]
+
+local player = game:GetService("Players").LocalPlayer
+local character = player.Character or player.CharacterAdded:Wait()
+local humanoid = character:WaitForChild("Humanoid")
+local rootPart = character:WaitForChild("HumanoidRootPart")
+local runService = game:GetService("RunService")
+
+-- Конфиг
+local config = {
+    scanDist = 15,           -- дальность сканирования
+    fov = 120,               -- угол обзора (градусы)
+    rays = 9,                -- количество лучей
+    maxStepHeight = 5,       -- макс. высота для прыжка на платформу
+    minGroundDist = 3,       -- минимальная дистанция до земли (чтобы не упасть)
+    jumpDist = 7,            -- дистанция активации прыжка
+    turnSpeed = 3,           -- скорость поворота (градусов/шаг)
+    walkSpeed = 26,
+    jumpPower = 65,
+    lineLength = 25,         -- длина линии (количество сегментов)
+    segmentSize = 1.2        -- длина одного сегмента
+}
+
+-- СОЗДАНИЕ СПЛОШНОЙ ЛИНИИ
+local function createSolidLine()
+    local lineFolder = Instance.new("Folder")
+    lineFolder.Name = "PathLine"
+    lineFolder.Parent = workspace
+
+    for i = 1, config.lineLength do
+        local seg = Instance.new("Part")
+        seg.Name = "Seg" .. i
+        seg.Size = Vector3.new(0.25, 0.25, config.segmentSize)
+        seg.BrickColor = BrickColor.new("Lime green")
+        seg.Material = Enum.Material.Neon
+        seg.Anchored = true
+        seg.CanCollide = false
+        seg.Transparency = 0.1
+        seg.Parent = lineFolder
+
+        local mesh = Instance.new("CylinderMesh")
+        mesh.Parent = seg
+    end
+
+    return lineFolder
+end
+
+local pathLine = createSolidLine()
+
+-- Структура для хранения истории позиций (для линии-хвоста)
+local history = {}
+for i = 1, config.lineLength do
+    table.insert(history, {
+        pos = rootPart.Position + Vector3.new(0, 1, 0),
+        dir = rootPart.CFrame.LookVector
+    })
+end
+
+-- Функция проверки наличия опоры (земли) в заданной точке
+local function hasGroundAt(position)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Blacklist
+    params.FilterDescendantsInstances = {character, pathLine}
+
+    local ray = workspace:Raycast(position, Vector3.new(0, -20, 0), params)
+    if ray then
+        local dist = (ray.Position - position).Magnitude
+        -- Если земля не слишком глубоко и не слишком высоко (относительно текущей позиции)
+        -- Для точки впереди нам важно, чтобы можно было на неё приземлиться
+        -- Пока просто проверяем, что луч попал во что-то
+        return true, dist, ray.Position
+    end
+    return false, nil, nil
+end
+
+-- Функция сканирования сектора с анализом опоры
+local function scanSector()
+    local rays = {}
+    local origin = rootPart.Position + Vector3.new(0, 2, 0)
+    local forward = rootPart.CFrame.LookVector
+    local right = rootPart.CFrame.RightVector
+
+    local startAngle = -config.fov / 2
+    local step = config.fov / (config.rays - 1)
+
+    for i = 1, config.rays do
+        local angle = math.rad(startAngle + (i-1) * step)
+        local dir = (forward * math.cos(angle) + right * math.sin(angle)).Unit
+
+        -- Параметры рейкаста вперёд
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Blacklist
+        params.FilterDescendantsInstances = {character, pathLine}
+
+        local hit = workspace:Raycast(origin, dir * config.scanDist, params)
+
+        local distance = config.scanDist
+        local hitPos = origin + dir * config.scanDist
+        local blocked = false
+        local jumpable = false
+
+        if hit then
+            distance = (hit.Position - origin).Magnitude
+            hitPos = hit.Position
+            local height = hit.Position.Y - origin.Y
+            if height > 0 and height < config.maxStepHeight then
+                jumpable = true   -- можно перепрыгнуть
+            elseif height >= config.maxStepHeight then
+                blocked = true    -- высокая стена
+            end
+            -- Если препятствие ниже уровня ног (впадина) - не блокирует, но надо смотреть опору
+        end
+
+        -- Теперь проверяем опору в конечной точке (или чуть дальше)
+        local groundCheckPos = hitPos + Vector3.new(0, 1, 0) -- чуть выше точки удара/окончания луча
+        local hasGround, groundDist, groundPos = hasGroundAt(groundCheckPos)
+
+        -- Сохраняем все параметры
+        table.insert(rays, {
+            dir = dir,
+            distance = distance,
+            hit = hit,
+            blocked = blocked,
+            jumpable = jumpable,
+            angle = angle,
+            hasGround = hasGround,
+            groundDist = groundDist,
+            groundPos = groundPos
+        })
+    end
+
+    return rays
+end
+
+-- Оценка пригодности направления
+local function rateDirection(ray)
+    if ray.blocked then
+        return -1  -- стена, непригодно
+    end
+    if ray.hasGround then
+        -- Есть опора - отлично, возвращаем вес (центральность)
+        return 1 / (1 + math.abs(ray.angle))  -- чем ближе к центру, тем больше вес
+    else
+        -- Нет опоры (пропасть) - плохо, но может быть, если альтернатив нет
+        return 0.1 / (1 + math.abs(ray.angle))
+    end
+end
+
+-- Выбор лучшего направления
+local function chooseDirection(rays)
+    local bestRay = nil
+    local bestScore = -math.huge
+
+    for _, ray in ipairs(rays) do
+        local score = rateDirection(ray)
+        if score > bestScore then
+            bestScore = score
+            bestRay = ray
+        end
+    end
+
+    if bestRay then
+        return bestRay.dir
+    else
+        -- На всякий случай возвращаем текущее направление
+        return rootPart.CFrame.LookVector
+    end
+end
+
+-- Проверка необходимости прыжка
+local function needJump()
+    local origin = rootPart.Position + Vector3.new(0, 2, 0)
+    local forward = rootPart.CFrame.LookVector
+
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Blacklist
+    params.FilterDescendantsInstances = {character, pathLine}
+
+    -- Луч прямо вперёд на расстояние прыжка
+    local ray = workspace:Raycast(origin, forward * config.jumpDist, params)
+
+    if ray then
+        local height = ray.Position.Y - origin.Y
+        if height > 0.5 and height < config.maxStepHeight then
+            return true  -- Низкое препятствие — прыгаем
+        end
+    end
+
+    -- Проверка пропасти прямо перед носом
+    local groundAhead = workspace:Raycast(
+        origin + forward * 2,
+        Vector3.new(0, -10, 0),
+        params
+    )
+    if not groundAhead then
+        return true
+    end
+
+    return false
+end
+
+-- Обновление линии (история позиций)
+local function updateLine()
+    if not rootPart then return end
+
+    local startPos = rootPart.Position + Vector3.new(0, 1.5, 0)
+    local startDir = rootPart.CFrame.LookVector
+
+    -- Обновляем историю
+    table.remove(history, config.lineLength)
+    table.insert(history, 1, {
+        pos = startPos,
+        dir = startDir
+    })
+
+    for i = 1, config.lineLength - 1 do
+        local seg = pathLine:FindFirstChild("Seg" .. i)
+        if seg then
+            local p1 = history[i].pos
+            local p2 = history[i+1].pos
+            local mid = (p1 + p2) / 2
+            local dir = (p2 - p1).Unit
+
+            if dir.Magnitude > 0.01 then
+                seg.CFrame = CFrame.lookAt(mid, mid + dir)
+                seg.Size = Vector3.new(0.25, 0.25, (p2 - p1).Magnitude)
+            end
+
+            -- Окраска в зависимости от наличия препятствий
+            local params = RaycastParams.new()
+            params.FilterType = Enum.RaycastFilterType.Blacklist
+            params.FilterDescendantsInstances = {character, pathLine}
+            local hit = workspace:Raycast(p1, (p2 - p1) * 1.1, params)
+            if hit then
+                seg.BrickColor = BrickColor.new("Bright red")
+            else
+                seg.BrickColor = BrickColor.new("Lime green")
+            end
+        end
+    end
+
+    -- Последний сегмент
+    local lastSeg = pathLine:FindFirstChild("Seg" .. config.lineLength)
+    if lastSeg then
+        local lastPos = history[config.lineLength].pos
+        lastSeg.CFrame = CFrame.lookAt(lastPos, lastPos + history[config.lineLength].dir)
+        lastSeg.Size = Vector3.new(0.25, 0.25, config.segmentSize)
+    end
+end
+
+-- Плавное изменение направления
+local currentDir = rootPart.CFrame.LookVector
+local targetDir = currentDir
+
+-- Главный цикл
+runService.Heartbeat:Connect(function()
+    pcall(function()
+        if not (humanoid and humanoid.Health > 0 and rootPart) then return end
+
+        -- 1. Сканирование
+        local rays = scanSector()
+        targetDir = chooseDirection(rays)
+
+        -- 2. Плавный поворот
+        local angle = math.acos(currentDir:Dot(targetDir))
+        if angle > math.rad(config.turnSpeed) then
+            local axis = currentDir:Cross(targetDir).Unit
+            if axis.Magnitude > 0.001 then
+                currentDir = CFrame.fromAxisAngle(axis, math.rad(config.turnSpeed)):VectorToWorldSpace(currentDir)
+            else
+                currentDir = targetDir
+            end
+        else
+            currentDir = targetDir
+        end
+
+        -- 3. Движение
+        local movePos = rootPart.Position + currentDir * 50
+        humanoid:MoveTo(movePos)
+        humanoid.WalkSpeed = config.walkSpeed
+
+        -- 4. Прыжок
+        if needJump() then
+            humanoid.Jump = true
+            wait(0.1)
+            humanoid.Jump = false
+        end
+
+        -- 5. Обновление линии
+        updateLine()
+    end)
+end)
+
+-- Пересоздание линии при смерти
+player.CharacterAdded:Connect(function()
+    character = player.Character
+    humanoid = character:WaitForChild("Humanoid")
+    rootPart = character:WaitForChild("HumanoidRootPart")
+    wait(0.5)
+
+    if pathLine then
+        pathLine:Destroy()
+    end
+    pathLine = createSolidLine()
+
+    history = {}
+    for i = 1, config.lineLength do
+        table.insert(history, {
+            pos = rootPart.Position + Vector3.new(0, 1, 0),
+            dir = rootPart.CFrame.LookVector
+        })
+    end
+
+    currentDir = rootPart.CFrame.LookVector
+    targetDir = currentDir
+end)
+
+print("=== ULTIMATE OBBY BOT v.9 ===")
+print("• Сканирование с учётом опоры (земли/платформ)")
+print("• Выбор направления, где можно идти/прыгнуть")
+print("• Зелёная линия-хвост")
